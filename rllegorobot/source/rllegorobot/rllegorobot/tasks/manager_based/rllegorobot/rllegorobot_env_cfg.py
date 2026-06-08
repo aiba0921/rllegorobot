@@ -69,9 +69,9 @@ def reward_track_command_spin(env, asset_cfg: SceneEntityCfg):
     asset = env.scene[asset_cfg.name]
     body_ang_vel = asset.data.body_ang_vel_w[:, asset_cfg.body_ids[0]]
     current_spin_vel = torch.nan_to_num(body_ang_vel[:, 2], nan=0.0, posinf=100.0, neginf=-100.0)
-    target_vel = env.command_manager.get_command("base_velocity")[:, 2] 
+    target_vel = env.command_manager.get_command("base_velocity")[:, 2]
     error = torch.square(current_spin_vel - target_vel)
-    return torch.exp(-error / 0.5)
+    return torch.exp(-error / 0.2)
 
 def reward_arm_horizontal_maintaining(env, asset_cfg: SceneEntityCfg):
     asset = env.scene[asset_cfg.name]
@@ -94,7 +94,7 @@ def penalty_low_posture(env, target_height: float, asset_cfg: SceneEntityCfg):
     
     error = torch.clamp(target_height - current_h, min=0.0, max=1.0)
     return torch.square(error)
-        
+     
 def penalty_leg_stretch_in_air(env, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg):
     """
     【統合版】空中にいる時のみ、Part_1からPart_3およびPart_3_01までの距離が
@@ -138,14 +138,25 @@ def reward_jump_push_off(env, asset_cfg: SceneEntityCfg):
     y_vel = torch.nan_to_num(asset.data.body_lin_vel_w[:, body_idx, 1], nan=0.0, posinf=0.0, neginf=0.0)
     
     # 【修正】max=3.0 を追加（現実的な最大上向き速度を例えば 3.0 m/s に制限）
-    reward = torch.clamp(y_vel, min=0.0, max=0.15) 
+    reward = torch.clamp(y_vel, min=0.0, max=0.15)
     
     return reward
-            
+
+def joint_symmetry_penalty(env, asset_cfg, joint_names: list[str]) -> torch.Tensor:
+    """2つの関節が対称（逆方向）に動くことを強要するペナルティ"""
+    asset = env.scene[asset_cfg.name]
+    
+    # 指定された2つの関節の角度データを取得
+    joint_indices = asset.find_joints(joint_names)[0]
+    q_left = asset.data.joint_pos[:, joint_indices[0]]
+    q_right = asset.data.joint_pos[:, joint_indices[1]]
+    
+    return torch.square(q_left + q_right)
+
 def penalty_feet_ground_time(env, asset_cfg: SceneEntityCfg):
     contact_sensor = env.scene[asset_cfg.name]
     safe_forces = torch.nan_to_num(contact_sensor.data.net_forces_w[:, :, 2], nan=0.0, posinf=1000.0, neginf=-1000.0)
-    is_contact = safe_forces > 1.0
+    is_contact = safe_forces > 0.1
 
     if not hasattr(env, "feet_ground_time"):
         env.feet_ground_time = torch.zeros_like(is_contact, dtype=torch.float)
@@ -196,15 +207,19 @@ def termination_part1_contact(env, threshold_h: float, robot_cfg: SceneEntityCfg
     
     return is_contact_force | is_too_low
 
+def body_height_below_minimum(env, minimum_height: float, asset_cfg) -> torch.Tensor:
+    asset = env.scene[asset_cfg.name]
+    body_pos_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    return torch.any(body_pos_z < minimum_height, dim=-1)
+
 def termination_physics_blowup(env, asset_cfg: SceneEntityCfg):
     asset = env.scene[asset_cfg.name]
-    
     j_vel = asset.data.joint_vel
     b_lin_vel = asset.data.root_lin_vel_w
     b_ang_vel = asset.data.root_ang_vel_w
 
-    is_nan = (torch.isnan(j_vel).any(dim=1) | 
-              torch.isnan(b_lin_vel).any(dim=1) | 
+    is_nan = (torch.isnan(j_vel).any(dim=1) |
+              torch.isnan(b_lin_vel).any(dim=1) |
               torch.isnan(b_ang_vel).any(dim=1))
               
     is_j_huge = torch.max(torch.abs(j_vel), dim=1)[0] > 50.0
@@ -213,25 +228,14 @@ def termination_physics_blowup(env, asset_cfg: SceneEntityCfg):
     
     return is_nan | is_j_huge | is_b_huge | is_a_huge
 
-def penalty_leg_crossing(env, asset_cfg: SceneEntityCfg):
-    """Part_2とPart_2_01が一定距離以上に近づく（交差する）ことを罰する"""
+def penalty_leg_crossing(env, asset_cfg, threshold: float = 0.05) -> torch.Tensor:
     asset = env.scene[asset_cfg.name]
+    body_ids = asset_cfg.body_ids
+    pos_1 = asset.data.body_pos_w[:, body_ids[0], :]
+    pos_2 = asset.data.body_pos_w[:, body_ids[1], :]
+    distance = torch.norm(pos_1 - pos_2, dim=-1)
+    return torch.where(distance < threshold, torch.tensor(1.0, device=env.device), torch.tensor(0.0, device=env.device))
     
-    idx_2 = asset_cfg.body_ids[0]
-    idx_2_01 = asset_cfg.body_ids[1]
-    
-    pos_2 = asset.data.body_pos_w[:, idx_2, :]
-    pos_2_01 = asset.data.body_pos_w[:, idx_2_01, :]
-    
-    # 2つのパーツの距離を計算
-    dist = torch.norm(pos_2 - pos_2_01, dim=-1)
-    
-    # 距離が 0.08m (8cm) 以下になったら、その食い込んだ分だけペナルティ
-    # ※ 0.08 の部分は実際のロボットの脚の隙間の幅に合わせて調整してください
-    crossing_penalty = torch.clamp(0.04 - dist, min=0.0)
-    
-    return crossing_penalty
-
 ##
 # 3. 環境設定クラス群
 ##
@@ -244,16 +248,16 @@ class CommandsCfg:
         rel_standing_envs=0.1,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0),
-            ang_vel_z=(0.5, 3.0),
+            ang_vel_z=(0.3, 0.3),
         ),
     )
 
 @configclass
 class ActionsCfg:
     joint_pos = mdp.JointPositionActionCfg(
-        asset_name="robot", 
-        joint_names=["__07", "_"], 
-        scale=0.1, 
+        asset_name="robot",
+        joint_names=["__07", "_", "__08", "_0"],
+        scale=0.1,
         use_default_offset=True
     )
 
@@ -261,8 +265,8 @@ class ActionsCfg:
 class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
-        joint_pos = ObsTerm(func=safe_joint_pos_rel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=["__07", "_"])})
-        joint_vel = ObsTerm(func=safe_joint_vel_rel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=["__07", "_"])})
+        joint_pos = ObsTerm(func=safe_joint_pos_rel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=["__07", "_", "__08", "_0"])})
+        joint_vel = ObsTerm(func=safe_joint_vel_rel, params={"asset_cfg": SceneEntityCfg("robot", joint_names=["__07", "_", "__08", "_0"])})
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         def __post_init__(self):
             self.enable_corruption = False
@@ -272,62 +276,69 @@ class ObservationsCfg:
 @configclass
 class EventCfg:
     reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_scale, 
-        mode="reset", 
+        func=mdp.reset_joints_by_scale,
+        mode="reset",
         params={"position_range": (0.9, 1.1), "velocity_range": (0.0, 0.0)},
     )
 
 @configclass
 class RewardsCfg:
-    alive = RewTerm(func=mdp.is_alive, weight=1.0)
-    
-    # 重みを強化し、ペナルティをスパルタ化（サボり対策）
-# 以前のバランスに戻す
+    alive = RewTerm(func=mdp.is_alive, weight=0.0)
     posture_penalty = RewTerm(
-        func=penalty_low_posture, 
-        weight=-10.0, 
+        func=penalty_low_posture,
+        weight=-10.0,
         params={"target_height": 0.1, "asset_cfg": SceneEntityCfg("robot", body_names=["Part_1"])}
     )
-        
-    track_spin_vel = RewTerm(func=reward_track_command_spin, weight=20.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=["Part_6"])})
+     
+    track_spin_vel = RewTerm(func=reward_track_command_spin, weight=30.0, params={"asset_cfg": SceneEntityCfg("robot", body_names=["Part_6"])})
     
-    # 【新規】空中で足を伸ばすペナルティ
-# 【修正】空中で両足を揃えて伸ばすペナルティ（統合版）
     leg_stretch_in_air = RewTerm(
         func=penalty_leg_stretch_in_air,
-        weight=-5.0, 
+        weight=-5.0,
         params={
-            # Part_1を基準点として最初に書き、次に評価したい2つの足先を書く
             "asset_cfg": SceneEntityCfg("robot", body_names=["Part_1", "Part_3", "Part_3_01"]),
             "sensor_cfg": SceneEntityCfg("feet_contact")
         }
     )
-        
-    # 【新規】地面を蹴って飛び上がるジャンプ報酬
-# 【修正】Part_1の上昇速度を評価する
+     
     jump_push_off = RewTerm(
         func=reward_jump_push_off,
-        weight=5.0, 
+        weight=5.0,
         params={
-            # 速度を測りたい具体的な動くパーツを指定する
-            "asset_cfg": SceneEntityCfg("robot", body_names=["Part_1"]) 
+            "asset_cfg": SceneEntityCfg("robot", body_names=["Part_1"])
         }
     )
-            
-    # 【新規】脚の交差・干渉ペナルティ
-    leg_crossing = RewTerm(
-        func=penalty_leg_crossing,
+             
+    asymmetric_movement = RewTerm(
+        func=joint_symmetry_penalty,
         weight=-10.0,
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=["Part_2", "Part_2_01"])
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names": ["_", "__07", "__08", "_0"]
         }
     )
     
-    feet_ground_time = RewTerm(func=penalty_feet_ground_time, weight=-2.0, params={"asset_cfg": SceneEntityCfg("feet_contact")})
+    penalty_leg_crossing_upper = RewTerm(
+        func=penalty_leg_crossing,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["Part_2", "Part_2_01"]),
+        }
+    )
+
+    penalty_leg_crossing_lower = RewTerm(
+        func=penalty_leg_crossing,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["Part_2_02", "Part_2_03"]),
+        }
+    )
+     
+    feet_ground_time = RewTerm(func=penalty_feet_ground_time, weight=-5.0, params={"asset_cfg": SceneEntityCfg("feet_contact")})
     
     foot_slip = RewTerm(
-        func=penalty_foot_slip, 
-        weight=-1.0, 
+        func=penalty_foot_slip,
+        weight=-1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=["Part_3.*"]),
             "sensor_cfg": SceneEntityCfg("feet_contact")
@@ -348,16 +359,24 @@ class TerminationsCfg:
     bad_tilt = DoneTerm(func=termination_bad_tilt_arm_advanced, params={"asset_cfg": SceneEntityCfg("robot", body_names=["Part_5"])})
     
     part1_contact = DoneTerm(
-        func=termination_part1_contact, 
+        func=termination_part1_contact,
         params={
-            "threshold_h": 0.01, 
+            "threshold_h": 0.01,
             "robot_cfg": SceneEntityCfg("robot", body_names=["Part_1"]),
             "sensor_cfg": SceneEntityCfg("part1_contact")
         }
     )
     
+    part2_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={
+            "sensor_cfg": SceneEntityCfg("part2_contact_sensor"),
+            "threshold": 0.1,
+        }
+    )
+     
     physics_blowup = DoneTerm(
-        func=termination_physics_blowup, 
+        func=termination_physics_blowup,
         params={"asset_cfg": SceneEntityCfg("robot")}
     )
 
@@ -367,7 +386,7 @@ class RllegorobotSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Robot",
         spawn=sim_utils.UsdFileCfg(
-            usd_path="/home/aibayuto/Documents/plate_07/Assembly_1_edit.usd",
+            usd_path="/home/aibayuto/Documents/plate_11/Assembly_1_edit.usd",
             activate_contact_sensors=True,
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 fix_root_link=True,
@@ -376,25 +395,27 @@ class RllegorobotSceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.0, 0.0, 0.41), 
+            pos=(0.0, 0.0, 0.41),
             joint_pos={
-                "__07": 0.5, "_": 0.5, 
+                "__07": 0.0, "_": 0.0,
                 "__02": 0.0, "__04": 0.0,
-                "__05": 0.0, "__06": 0.0, "__01": 0.0
+                "__05": 0.0, "__06": 0.0, "__01": 0.0,
+                "__08": 0.0, "_0": 0.0,
+                "__1": 0.0, "__1_01": 0.0
             },
         ),
         actuators={
             "kicking_legs": ImplicitActuatorCfg(
-                joint_names_expr=["__07", "_"], 
-                stiffness=10.0, 
-                damping=0.2, 
+                joint_names_expr=["__07", "_", "__08", "_0"],
+                stiffness=10.0,
+                damping=0.2,
                 effort_limit=0.325,
                 velocity_limit=11.7,
                 armature=0.01
             ),
             "passive_joints": ImplicitActuatorCfg(
-                joint_names_expr=["__02", "__04", "__05", "__06", "__01"], 
-                stiffness=0.0, 
+                joint_names_expr=["__02", "__05", "__06", "__01", "__04", "__1", "__1_01"],
+                stiffness=0.0,
                 damping=0.5,
                 effort_limit=0.0,
                 velocity_limit=15.0,
@@ -405,6 +426,7 @@ class RllegorobotSceneCfg(InteractiveSceneCfg):
     
     feet_contact = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*/Part_3.*", history_length=3, track_air_time=False)
     part1_contact = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*/Part_1.*", history_length=3, track_air_time=False)
+    part2_contact_sensor = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*/Part_2.*", history_length=3, track_air_time=False)
     
     dome_light = AssetBaseCfg(prim_path="/World/DomeLight", spawn=sim_utils.DomeLightCfg(intensity=500.0))
 

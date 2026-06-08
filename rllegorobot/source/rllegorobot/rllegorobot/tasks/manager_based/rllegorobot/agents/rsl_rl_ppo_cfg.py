@@ -9,7 +9,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24  # G1に合わせ、データを少し多めに収集して安定化
-    max_iterations = 2000   # 学習回数を確保
+    max_iterations = 5000   # 学習回数を確保
     save_interval = 50
     experiment_name = "rl_legorobot"
     
@@ -30,7 +30,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.01,         # 探索を促すためG1(0.008)よりわずかに高く設定
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=5.0e-4,      # 急激な変化を防ぐため、1e-3から少し下げて慎重に学習
+        learning_rate=1.0e-3,      # 急激な変化を防ぐため、1e-3から少し下げて慎重に学習
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
